@@ -1,87 +1,174 @@
 import { routePartykitRequest, Server } from "partyserver";
 
-import type { OutgoingMessage, Position } from "../shared";
+import type {
+  IncomingMessage,
+  OutgoingMessage,
+  Position,
+  Signal,
+} from "../shared";
 import type { Connection, ConnectionContext } from "partyserver";
 
-// This is the state that we'll store on each connection
 type ConnectionState = {
-	position: Position;
+  position?: Position;
+  lastSignalAt?: number;
 };
 
+const SIGNALS_KEY = "public-signals";
+const MAX_SIGNALS = 500;
+const SIGNAL_COOLDOWN_MS = 2000;
+
 export class Globe extends Server {
-	onConnect(conn: Connection<ConnectionState>, ctx: ConnectionContext) {
-		// Whenever a fresh connection is made, we'll
-		// send the entire state to the new connection
+  async onConnect(
+    conn: Connection<ConnectionState>,
+    ctx: ConnectionContext,
+  ): Promise<void> {
+    const signals =
+      (await this.ctx.storage.get<Signal[]>(SIGNALS_KEY)) ?? [];
 
-		// First, let's extract the position from the Cloudflare headers
-		const latitude = ctx.request.cf?.latitude as string | undefined;
-		const longitude = ctx.request.cf?.longitude as string | undefined;
-		if (!latitude || !longitude) {
-			console.warn(`Missing position information for connection ${conn.id}`);
-			return;
-		}
-		const position = {
-			lat: parseFloat(latitude),
-			lng: parseFloat(longitude),
-			id: conn.id,
-		};
-		// And save this on the connection's state
-		conn.setState({
-			position,
-		});
+    conn.send(
+      JSON.stringify({
+        type: "sync-signals",
+        signals,
+      } satisfies OutgoingMessage),
+    );
 
-		// Now, let's send the entire state to the new connection
-		for (const connection of this.getConnections<ConnectionState>()) {
-			try {
-				conn.send(
-					JSON.stringify({
-						type: "add-marker",
-						// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-						position: connection.state!.position,
-					} satisfies OutgoingMessage),
-				);
+    const latitude = ctx.request.cf?.latitude as string | undefined;
+    const longitude = ctx.request.cf?.longitude as string | undefined;
 
-				// And let's send the new connection's position to all other connections
-				if (connection.id !== conn.id) {
-					connection.send(
-						JSON.stringify({
-							type: "add-marker",
-							position,
-						} satisfies OutgoingMessage),
-					);
-				}
-			} catch {
-				this.onCloseOrError(conn);
-			}
-		}
-	}
+    if (!latitude || !longitude) {
+      console.warn(`Missing position information for connection ${conn.id}`);
+      return;
+    }
 
-	// Whenever a connection closes (or errors), we'll broadcast a message to all
-	// other connections to remove the marker.
-	onCloseOrError(connection: Connection) {
-		this.broadcast(
-			JSON.stringify({
-				type: "remove-marker",
-				id: connection.id,
-			} satisfies OutgoingMessage),
-			[connection.id],
-		);
-	}
+    const position: Position = {
+      lat: parseFloat(latitude),
+      lng: parseFloat(longitude),
+      id: conn.id,
+    };
 
-	onClose(connection: Connection): void | Promise<void> {
-		this.onCloseOrError(connection);
-	}
+    conn.setState({ position });
 
-	onError(connection: Connection): void | Promise<void> {
-		this.onCloseOrError(connection);
-	}
+    for (const connection of this.getConnections<ConnectionState>()) {
+      const existingPosition = connection.state?.position;
+
+      if (!existingPosition) {
+        continue;
+      }
+
+      conn.send(
+        JSON.stringify({
+          type: "add-marker",
+          position: existingPosition,
+        } satisfies OutgoingMessage),
+      );
+
+      if (connection.id !== conn.id) {
+        connection.send(
+          JSON.stringify({
+            type: "add-marker",
+            position,
+          } satisfies OutgoingMessage),
+        );
+      }
+    }
+  }
+
+  async onMessage(
+    conn: Connection<ConnectionState>,
+    message: string | ArrayBuffer,
+  ): Promise<void> {
+    if (typeof message !== "string") {
+      return;
+    }
+
+    let payload: IncomingMessage;
+
+    try {
+      payload = JSON.parse(message) as IncomingMessage;
+    } catch {
+      return;
+    }
+
+    if (payload.type !== "place-signal") {
+      return;
+    }
+
+    if (
+      !Number.isFinite(payload.lat) ||
+      !Number.isFinite(payload.lng) ||
+      payload.lat < -90 ||
+      payload.lat > 90 ||
+      payload.lng < -180 ||
+      payload.lng > 180
+    ) {
+      return;
+    }
+
+    const now = Date.now();
+    const state = conn.state ?? {};
+
+    if (
+      state.lastSignalAt &&
+      now - state.lastSignalAt < SIGNAL_COOLDOWN_MS
+    ) {
+      return;
+    }
+
+    conn.setState({
+      ...state,
+      lastSignalAt: now,
+    });
+
+    const signal: Signal = {
+      id: crypto.randomUUID(),
+      lat: payload.lat,
+      lng: payload.lng,
+      createdAt: now,
+    };
+
+    const signals =
+      (await this.ctx.storage.get<Signal[]>(SIGNALS_KEY)) ?? [];
+
+    signals.push(signal);
+
+    if (signals.length > MAX_SIGNALS) {
+      signals.splice(0, signals.length - MAX_SIGNALS);
+    }
+
+    await this.ctx.storage.put(SIGNALS_KEY, signals);
+
+    this.broadcast(
+      JSON.stringify({
+        type: "add-signal",
+        signal,
+      } satisfies OutgoingMessage),
+    );
+  }
+
+  onCloseOrError(connection: Connection<ConnectionState>) {
+    this.broadcast(
+      JSON.stringify({
+        type: "remove-marker",
+        id: connection.id,
+      } satisfies OutgoingMessage),
+      [connection.id],
+    );
+  }
+
+  onClose(connection: Connection<ConnectionState>): void {
+    this.onCloseOrError(connection);
+  }
+
+  onError(connection: Connection<ConnectionState>): void {
+    this.onCloseOrError(connection);
+  }
 }
 
 export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
-		return (
-			(await routePartykitRequest(request, { ...env })) ||
-			new Response("Not Found", { status: 404 })
-		);
-	},
+  async fetch(request: Request, env: Env): Promise<Response> {
+    return (
+      (await routePartykitRequest(request, { ...env })) ||
+      new Response("Not Found", { status: 404 })
+    );
+  },
 } satisfies ExportedHandler<Env>;
